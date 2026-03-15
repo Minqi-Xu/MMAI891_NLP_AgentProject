@@ -1,9 +1,11 @@
 # Adaptive Study Agent POC
 
 This project implements a **Create-mode agentic POC** based on your Agent Design Canvas:
-- Input: uploaded learning material (TXT/PDF/DOCX/PPTX)
+- Input: one or many uploaded learning files (TXT/PDF/DOCX/PPTX)
 - Agent steps: summarization -> concept extraction -> quiz generation -> answer evaluation -> adaptive difficulty routing -> explanations + study actions
 - Output: summary, quiz, performance report, and adaptive follow-up quiz preview
+- Long-input handling: automatic chunking and chunk-summary aggregation for large multi-file content sets
+- Persistent local memory per topic: previous confidence and weak concepts are saved to `data/user_memory.json`
 
 ## 1) Quick Start
 
@@ -46,7 +48,7 @@ If no key is set (file or env), the app runs in fallback mode for offline demo.
 3. Generate summary + initial quiz
 4. Complete quiz with mixed accuracy and confidence
 5. Show:
-   - score and route decision (`foundational/standard/advanced`)
+   - score and confidence-based route decision (`foundational/standard/advanced`)
    - confidence mismatch warning
    - targeted explanations and recommendations
    - adaptive round-2 quiz preview
@@ -68,12 +70,12 @@ This prints average round-1/round-2 scores and adaptive uplift versus static bas
 ## 4) Scope Boundaries (MVP)
 
 Included:
-- Single-session memory (answers, confidence, score)
-- Explicit decision logic for adaptive routing
+- Persistent per-topic local memory (saved to local file)
+- Explicit confidence-based decision logic for adaptive routing
 - Explainable output a learner can act on
 
 Intentionally left out:
-- Authentication / persistent learner profiles
+- Authentication / cloud-synced learner profiles
 - Institutional LMS integration
 - Human instructor override workflows
 

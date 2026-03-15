@@ -1,10 +1,9 @@
 import json
 import os
-import random
 import re
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -46,6 +45,7 @@ class QuizResult:
     accuracy: float
     wrong_indices: List[int]
     confidence_mismatch: bool
+    avg_confidence: float
     next_difficulty: str
 
 
@@ -53,6 +53,93 @@ class QuizResult:
 # Helpers
 # -----------------------------
 API_KEY_FILE = os.getenv("OPENAI_API_KEY_FILE", "secrets/openai_api_key.txt")
+MAX_CHARS_PER_CHUNK = 10000
+MEMORY_FILE = "data/user_memory.json"
+
+
+def normalize_topic(topic: str) -> str:
+    return re.sub(r"\s+", " ", topic.strip().lower())
+
+
+def load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"topics": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"topics": {}}
+        data.setdefault("topics", {})
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"topics": {}}
+
+
+def save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=2)
+
+
+def clear_memory(path: str = MEMORY_FILE) -> None:
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def get_topic_record(memory: Dict[str, Any], topic: str) -> Dict[str, Any]:
+    topic_key = normalize_topic(topic)
+    topics = memory.setdefault("topics", {})
+    if topic_key not in topics:
+        topics[topic_key] = {
+            "display_topic": topic.strip(),
+            "sessions": 0,
+            "last_avg_confidence": None,
+            "last_routed_difficulty": None,
+            "concept_stats": {},
+        }
+    return topics[topic_key]
+
+
+def confidence_to_difficulty(avg_confidence: float) -> str:
+    rounded = int(round(avg_confidence))
+    if rounded <= 2:
+        return "foundational"
+    if rounded == 3:
+        return "standard"
+    return "advanced"
+
+
+def top_mistake_concepts(topic_record: Dict[str, Any], limit: int = 5) -> List[str]:
+    concept_stats = topic_record.get("concept_stats", {})
+    ranked = sorted(
+        concept_stats.items(),
+        key=lambda kv: (kv[1].get("wrong", 0), kv[1].get("seen", 0)),
+        reverse=True,
+    )
+    return [concept for concept, stat in ranked if stat.get("wrong", 0) > 0][:limit]
+
+
+def update_topic_memory(
+    memory: Dict[str, Any],
+    topic: str,
+    quiz: List[QuizQuestion],
+    wrong_indices: List[int],
+    avg_confidence: float,
+    routed_difficulty: str,
+) -> None:
+    rec = get_topic_record(memory, topic)
+    rec["sessions"] = int(rec.get("sessions", 0)) + 1
+    rec["last_avg_confidence"] = avg_confidence
+    rec["last_routed_difficulty"] = routed_difficulty
+    concept_stats = rec.setdefault("concept_stats", {})
+
+    wrong_set = set(wrong_indices)
+    for i, q in enumerate(quiz):
+        c = q.concept.strip().lower()
+        stat = concept_stats.setdefault(c, {"seen": 0, "wrong": 0})
+        stat["seen"] += 1
+        if i in wrong_set:
+            stat["wrong"] += 1
 
 
 def read_api_key_from_file(path: str) -> Optional[str]:
@@ -106,7 +193,20 @@ def extract_text_from_file(uploaded_file) -> str:
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:15000]
+    return text
+
+
+def chunk_text(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> List[str]:
+    text = clean_text(text)
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 def safe_json_load(raw: str) -> Dict[str, Any]:
@@ -125,7 +225,9 @@ def sentence_chunks(text: str, n: int = 5) -> List[str]:
     return [sentences[i % len(sentences)] for i in range(n)]
 
 
-def fallback_study_pack(text: str, difficulty: str = "standard") -> StudyPack:
+def fallback_study_pack(
+    text: str, difficulty: str = "standard", focus_concepts: Optional[List[str]] = None
+) -> StudyPack:
     chunks = sentence_chunks(text, 8)
     summary = " ".join(chunks[:3])
 
@@ -139,6 +241,9 @@ def fallback_study_pack(text: str, difficulty: str = "standard") -> StudyPack:
             break
     if not concepts:
         concepts = ["core concept", "key idea", "application", "analysis"]
+    if focus_concepts:
+        prioritized = [c.strip().lower() for c in focus_concepts if c.strip()]
+        concepts = list(dict.fromkeys(prioritized + concepts))
 
     questions: List[QuizQuestion] = []
     level_word = {
@@ -151,6 +256,8 @@ def fallback_study_pack(text: str, difficulty: str = "standard") -> StudyPack:
         concept = concepts[i % len(concepts)]
         stem = chunks[(i + 2) % len(chunks)]
         question = f"({level_word}) What is the best interpretation of this material segment? {stem[:120]}"
+        if difficulty == "foundational":
+            question += f" Hint: Focus on the core meaning of '{concept}'."
         options = [
             f"Option A: Definition related to {concept}",
             f"Option B: Misinterpretation of {concept}",
@@ -170,8 +277,31 @@ def fallback_study_pack(text: str, difficulty: str = "standard") -> StudyPack:
     return StudyPack(summary=summary, key_concepts=concepts[:5], quiz=questions)
 
 
+def summarize_chunk_with_llm(client: OpenAI, chunk: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
+    prompt = f"""
+You are summarizing one chunk of study material.
+Return strict JSON with keys:
+- chunk_summary: string (2-4 sentences)
+- key_concepts: array of up to 5 short concept strings
+
+Chunk:
+{chunk}
+"""
+    response = client.responses.create(
+        model=model,
+        input=prompt,
+        temperature=0.2,
+    )
+    return safe_json_load(response.output_text)
+
+
 def generate_study_pack_with_llm(
-    client: OpenAI, text: str, difficulty: str = "standard", model: str = "gpt-4o-mini"
+    client: OpenAI,
+    text: str,
+    difficulty: str = "standard",
+    model: str = "gpt-4o-mini",
+    focus_concepts: Optional[List[str]] = None,
+    topic: Optional[str] = None,
 ) -> StudyPack:
     system_prompt = (
         "You are an educational assistant. Return strict JSON with keys: "
@@ -180,9 +310,51 @@ def generate_study_pack_with_llm(
         "correct_index (0-3 int), explanation (string), concept (string)."
     )
 
+    chunks = chunk_text(text)
+    if len(chunks) == 1:
+        source_for_generation = chunks[0]
+    else:
+        chunk_summaries: List[str] = []
+        concept_pool: List[str] = []
+        for chunk in chunks:
+            partial = summarize_chunk_with_llm(client, chunk, model)
+            summary = clean_text(str(partial.get("chunk_summary", "")))
+            if summary:
+                chunk_summaries.append(summary)
+
+            for concept in partial.get("key_concepts", []):
+                c = clean_text(str(concept)).lower()
+                if c and c not in concept_pool:
+                    concept_pool.append(c)
+
+        source_for_generation = (
+            "Aggregated chunk summaries:\n"
+            + "\n".join(f"- {s}" for s in chunk_summaries[:80])
+            + "\n\nCandidate concepts:\n"
+            + ", ".join(concept_pool[:30])
+        )
+
+    focus_instruction = ""
+    if focus_concepts:
+        focus_instruction = (
+            "Prior weak concepts to prioritize in the quiz:\n"
+            + ", ".join(focus_concepts)
+            + "\nEnsure at least 3 questions are centered on these concepts.\n"
+        )
+
+    hint_instruction = (
+        "For foundational difficulty, include a short hint in each question stem.\n"
+        if difficulty == "foundational"
+        else ""
+    )
+
+    topic_instruction = f"Topic label: {topic}\n" if topic else ""
+
     user_prompt = f"""
 Source material:
-{text}
+{source_for_generation}
+{topic_instruction}
+{focus_instruction}
 
 Task:
 1) Create a concise structured summary suitable for student revision.
@@ -190,6 +362,8 @@ Task:
 3) Create 5 multiple-choice questions at {difficulty} difficulty.
 4) Questions must test understanding, not just copying text.
 5) Keep explanations short but instructive.
+6) For each question, ensure explanation includes why the correct option is right and why one likely wrong option is wrong.
+{hint_instruction}
 Return only valid JSON.
 """
 
@@ -229,12 +403,8 @@ def evaluate_quiz(
         if (confidence[i] >= 4 and not is_correct) or (confidence[i] <= 2 and is_correct):
             mismatch_count += 1
 
-    if score <= 2:
-        next_diff = "foundational"
-    elif score == 3:
-        next_diff = "standard"
-    else:
-        next_diff = "advanced"
+    avg_conf = sum(confidence) / len(confidence)
+    next_diff = confidence_to_difficulty(avg_conf)
 
     return QuizResult(
         score=score,
@@ -242,6 +412,7 @@ def evaluate_quiz(
         accuracy=score / len(quiz),
         wrong_indices=wrong_indices,
         confidence_mismatch=mismatch_count >= 2,
+        avg_confidence=avg_conf,
         next_difficulty=next_diff,
     )
 
@@ -274,7 +445,10 @@ Key concepts list:
 {json.dumps(key_concepts)}
 
 Provide strict JSON with:
-- explanations: array of short personalized explanations aligned to each mistake
+- explanations: array of short personalized explanations aligned to each mistake.
+  Each explanation must explicitly include:
+  (a) why the correct option is correct
+  (b) why the learner's selected option is incorrect
 - recommendations: array of 3 targeted study actions
 """
 
@@ -296,8 +470,9 @@ def fallback_explanations(
         chosen = q.options[answers[idx]]
         correct = q.options[q.correct_index]
         exps.append(
-            f"For '{q.concept}', your answer '{chosen}' missed the key idea. The better answer was '{correct}'. "
-            f"Reason: {q.explanation}"
+            f"For concept '{q.concept}', the correct answer is '{correct}' because it matches the key idea. "
+            f"Your selected answer '{chosen}' is incorrect because it does not align with the concept focus. "
+            f"Detailed reason: {q.explanation}"
         )
 
     recs = [
@@ -310,12 +485,16 @@ def fallback_explanations(
 
 def init_state() -> None:
     defaults = {
+        "topic": "",
         "source_text": "",
+        "source_file_count": 0,
         "study_pack": None,
         "round2_pack": None,
         "quiz_submitted": False,
         "result": None,
         "explanations": None,
+        "active_focus_concepts": [],
+        "active_difficulty": "standard",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -332,6 +511,7 @@ st.caption("POC aligned to Agent Design Canvas (Create Mode)")
 init_state()
 client = get_openai_client()
 llm_mode = "OpenAI API" if client else "Fallback (No API key detected)"
+memory = load_memory()
 
 with st.sidebar:
     st.subheader("Settings")
@@ -340,40 +520,125 @@ with st.sidebar:
     st.info(
         f"Use `OPENAI_API_KEY` env var or store key in `{API_KEY_FILE}` to use LLM mode."
     )
+    st.caption(f"Memory file: `{MEMORY_FILE}`")
+    if st.button("Clear All Saved Memory", type="secondary"):
+        clear_memory()
+        st.session_state.study_pack = None
+        st.session_state.round2_pack = None
+        st.session_state.quiz_submitted = False
+        st.session_state.result = None
+        st.session_state.explanations = None
+        st.session_state.active_focus_concepts = []
+        st.success("All saved topic memory was removed.")
+
+st.session_state.topic = st.text_input(
+    "Topic for this session (used for memory and adaptive future quizzes)",
+    value=st.session_state.topic,
+    placeholder="e.g., Cellular Respiration",
+)
+active_topic = st.session_state.topic.strip()
+if active_topic:
+    existing = memory.get("topics", {}).get(normalize_topic(active_topic), {})
+    if existing:
+        st.caption(
+            f"Past sessions for this topic: {existing.get('sessions', 0)} | "
+            f"Last avg confidence: {existing.get('last_avg_confidence', 'N/A')}"
+        )
 
 uploaded = st.file_uploader(
-    "Upload study material (TXT, PDF, DOCX, PPTX)", type=["txt", "pdf", "docx", "pptx"]
+    "Upload study material (TXT, PDF, DOCX, PPTX)",
+    type=["txt", "pdf", "docx", "pptx"],
+    accept_multiple_files=True,
 )
 
-if uploaded is not None:
-    try:
-        text = clean_text(extract_text_from_file(uploaded))
-        st.session_state.source_text = text
-        st.success(f"Loaded material: {uploaded.name} ({len(text)} chars)")
+if uploaded:
+    all_texts: List[str] = []
+    failed_files: List[Tuple[str, str]] = []
+    for f in uploaded:
+        try:
+            extracted = clean_text(extract_text_from_file(f))
+            if extracted:
+                labeled = f"[FILE: {f.name}]\n{extracted}"
+                all_texts.append(labeled)
+        except Exception as e:
+            failed_files.append((f.name, str(e)))
+
+    full_text = "\n\n".join(all_texts)
+    st.session_state.source_text = full_text
+    st.session_state.source_file_count = len(all_texts)
+
+    if all_texts:
+        st.success(
+            f"Loaded {len(all_texts)} file(s), total extracted length: {len(full_text):,} chars"
+        )
         with st.expander("Preview extracted text", expanded=False):
-            st.write(text[:2000] + ("..." if len(text) > 2000 else ""))
-    except Exception as e:
-        st.error(f"Could not process file: {e}")
+            st.write(full_text[:3000] + ("..." if len(full_text) > 3000 else ""))
+
+    for file_name, err in failed_files:
+        st.error(f"Could not process file '{file_name}': {err}")
 
 if st.button("Generate Summary + Initial Quiz", type="primary"):
-    if not st.session_state.source_text:
+    if not active_topic:
+        st.warning("Please enter a topic first.")
+    elif not st.session_state.source_text:
         st.warning("Please upload a document first.")
     else:
+        topic_rec = get_topic_record(memory, active_topic)
+        historical_focus = top_mistake_concepts(topic_rec, limit=5)
+        prior_conf = topic_rec.get("last_avg_confidence")
+        difficulty = (
+            confidence_to_difficulty(prior_conf)
+            if isinstance(prior_conf, (int, float))
+            else "standard"
+        )
+        st.session_state.active_focus_concepts = historical_focus
+        st.session_state.active_difficulty = difficulty
+
+        if historical_focus:
+            st.info(
+                "Applying memory-weighted focus concepts for this topic: "
+                + ", ".join(historical_focus)
+            )
+        if isinstance(prior_conf, (int, float)):
+            st.info(
+                f"Using previous topic confidence ({prior_conf:.2f}) -> "
+                f"start difficulty: {difficulty}"
+            )
+
+        chunk_count = len(chunk_text(st.session_state.source_text))
+        if chunk_count > 1:
+            st.info(
+                f"Large input detected from {st.session_state.source_file_count} file(s). "
+                f"Processing in {chunk_count} chunk(s)."
+            )
         with st.spinner("Generating study pack..."):
             try:
                 if client:
                     pack = generate_study_pack_with_llm(
-                        client, st.session_state.source_text, "standard", selected_model
+                        client,
+                        st.session_state.source_text,
+                        difficulty,
+                        selected_model,
+                        focus_concepts=historical_focus,
+                        topic=active_topic,
                     )
                 else:
-                    pack = fallback_study_pack(st.session_state.source_text, "standard")
+                    pack = fallback_study_pack(
+                        st.session_state.source_text,
+                        difficulty,
+                        focus_concepts=historical_focus,
+                    )
                 st.session_state.study_pack = pack
                 st.session_state.quiz_submitted = False
                 st.session_state.result = None
                 st.session_state.explanations = None
                 st.session_state.round2_pack = None
             except (ValidationError, json.JSONDecodeError, Exception):
-                pack = fallback_study_pack(st.session_state.source_text, "standard")
+                pack = fallback_study_pack(
+                    st.session_state.source_text,
+                    difficulty,
+                    focus_concepts=historical_focus,
+                )
                 st.session_state.study_pack = pack
                 st.session_state.quiz_submitted = False
                 st.session_state.result = None
@@ -420,6 +685,18 @@ if pack:
             result = evaluate_quiz(pack.quiz, answers, confidence)
             st.session_state.quiz_submitted = True
             st.session_state.result = result
+            wrong_concepts_current = [pack.quiz[i].concept.strip().lower() for i in result.wrong_indices]
+
+            if active_topic:
+                update_topic_memory(
+                    memory,
+                    active_topic,
+                    pack.quiz,
+                    result.wrong_indices,
+                    result.avg_confidence,
+                    result.next_difficulty,
+                )
+                save_memory(memory)
 
             if result.wrong_indices:
                 with st.spinner("Generating explanations..."):
@@ -446,21 +723,35 @@ if pack:
             # Generate adaptive second-round quiz as optional next step.
             with st.spinner("Preparing adaptive next round..."):
                 try:
+                    # Weight next quiz toward concepts the learner misses most.
+                    topic_rec_after = get_topic_record(memory, active_topic) if active_topic else {}
+                    historical_focus = top_mistake_concepts(topic_rec_after, limit=5)
+                    weighted_focus = list(
+                        dict.fromkeys(wrong_concepts_current + historical_focus + st.session_state.active_focus_concepts)
+                    )[:5]
+                    st.session_state.active_focus_concepts = weighted_focus
+
                     if client:
                         round2 = generate_study_pack_with_llm(
                             client,
                             st.session_state.source_text,
                             result.next_difficulty,
                             selected_model,
+                            focus_concepts=weighted_focus,
+                            topic=active_topic,
                         )
                     else:
                         round2 = fallback_study_pack(
-                            st.session_state.source_text, result.next_difficulty
+                            st.session_state.source_text,
+                            result.next_difficulty,
+                            focus_concepts=weighted_focus,
                         )
                     st.session_state.round2_pack = round2
                 except Exception:
                     st.session_state.round2_pack = fallback_study_pack(
-                        st.session_state.source_text, result.next_difficulty
+                        st.session_state.source_text,
+                        result.next_difficulty,
+                        focus_concepts=st.session_state.active_focus_concepts,
                     )
 
 if st.session_state.quiz_submitted and st.session_state.result:
@@ -470,7 +761,18 @@ if st.session_state.quiz_submitted and st.session_state.result:
 
     st.metric("Score", f"{result.score}/{result.total}")
     st.metric("Accuracy", f"{result.accuracy * 100:.0f}%")
-    st.write(f"**Adaptive route:** next quiz difficulty is **{result.next_difficulty}**")
+    st.metric("Average Confidence", f"{result.avg_confidence:.2f}/5")
+    st.write(
+        f"**Adaptive route (confidence-based):** next quiz difficulty is "
+        f"**{result.next_difficulty}**"
+    )
+    st.caption("Routing rule: confidence 1-2 -> foundational, 3 -> standard, 4-5 -> advanced")
+
+    if st.session_state.active_focus_concepts:
+        st.write(
+            "**Concept weighting for future quizzes:** "
+            + ", ".join(st.session_state.active_focus_concepts)
+        )
 
     if result.confidence_mismatch:
         st.warning(
@@ -491,20 +793,27 @@ if st.session_state.quiz_submitted and st.session_state.result:
     round2: Optional[StudyPack] = st.session_state.round2_pack
     if round2:
         st.subheader("Adaptive Quiz Preview (Round 2)")
-        st.caption("Generated based on your Round 1 score route.")
+        st.caption("Generated using confidence-based routing and historical weak-concept weighting.")
         for i, q in enumerate(round2.quiz, start=1):
             st.write(f"Q{i}: {q.question}")
             for opt in q.options:
                 st.write(f"- {opt}")
+        if st.button("Start This Adaptive Quiz Now"):
+            st.session_state.study_pack = round2
+            st.session_state.quiz_submitted = False
+            st.session_state.result = None
+            st.session_state.explanations = None
+            st.session_state.round2_pack = None
+            st.rerun()
 
 st.divider()
 with st.expander("Assignment alignment checklist", expanded=False):
     st.markdown(
         """
 - Problem-value fit: Reduces manual study prep by auto-generating summary + quiz.
-- Agent decision logic: Uses score routing and confidence mismatch branch.
+- Agent decision logic: Uses confidence-based routing, weak-concept weighting, and confidence mismatch branch.
 - Autonomy boundary: Agent recommends; learner remains decision-maker.
 - Realistic output: Summary, quiz, explanations, and study actions.
-- Evaluation-ready: Score, accuracy, route decision, and concept recommendations are logged per session.
+- Evaluation-ready: Score, accuracy, confidence route, and concept recommendations are logged per session.
 """
     )

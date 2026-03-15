@@ -13,6 +13,7 @@ venv/
 .env
 .env.*
 secrets/openai_api_key.txt
+data/user_memory.json
 
 # OS/editor noise
 .DS_Store
