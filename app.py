@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -96,6 +97,7 @@ def get_topic_record(memory: Dict[str, Any], topic: str) -> Dict[str, Any]:
             "last_avg_confidence": None,
             "last_routed_difficulty": None,
             "concept_stats": {},
+            "quiz_history": [],
         }
     return topics[topic_key]
 
@@ -126,6 +128,10 @@ def update_topic_memory(
     wrong_indices: List[int],
     avg_confidence: float,
     routed_difficulty: str,
+    score: int,
+    total: int,
+    accuracy: float,
+    confidence_mismatch: bool,
 ) -> None:
     rec = get_topic_record(memory, topic)
     rec["sessions"] = int(rec.get("sessions", 0)) + 1
@@ -140,6 +146,23 @@ def update_topic_memory(
         stat["seen"] += 1
         if i in wrong_set:
             stat["wrong"] += 1
+
+    wrong_concepts = [quiz[i].concept.strip().lower() for i in wrong_indices]
+    history = rec.setdefault("quiz_history", [])
+    history.append(
+        {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "score": score,
+            "total": total,
+            "accuracy_pct": round(accuracy * 100, 1),
+            "avg_confidence": round(avg_confidence, 2),
+            "routed_difficulty": routed_difficulty,
+            "confidence_mismatch": confidence_mismatch,
+            "wrong_concepts": wrong_concepts,
+        }
+    )
+    # Keep latest 100 entries per topic to limit file growth.
+    rec["quiz_history"] = history[-100:]
 
 
 def read_api_key_from_file(path: str) -> Optional[str]:
@@ -521,6 +544,7 @@ with st.sidebar:
         f"Use `OPENAI_API_KEY` env var or store key in `{API_KEY_FILE}` to use LLM mode."
     )
     st.caption(f"Memory file: `{MEMORY_FILE}`")
+    st.page_link("pages/Quiz_History.py", label="View Quiz History by Topic")
     if st.button("Clear All Saved Memory", type="secondary"):
         clear_memory()
         st.session_state.study_pack = None
@@ -695,6 +719,10 @@ if pack:
                     result.wrong_indices,
                     result.avg_confidence,
                     result.next_difficulty,
+                    result.score,
+                    result.total,
+                    result.accuracy,
+                    result.confidence_mismatch,
                 )
                 save_memory(memory)
 
