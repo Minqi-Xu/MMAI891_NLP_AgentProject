@@ -825,15 +825,16 @@ if st.button("Generate Summary + Initial Quiz", type="primary"):
 
 pack: Optional[StudyPack] = st.session_state.study_pack
 if pack:
-    col1, col2 = st.columns([1.3, 1])
+    # Three-column layout: summary (left), quiz (center), report/explanations (right).
+    left_col, center_col, right_col = st.columns([1.05, 1.35, 1.1])
 
-    with col1:
+    with left_col:
         st.subheader("Generated Summary")
         st.write(pack.summary)
         st.subheader("Key Concepts")
         st.write(", ".join(pack.key_concepts))
 
-    with col2:
+    with center_col:
         st.subheader(f"Current Quiz (Attempt {st.session_state.quiz_attempt_number})")
         with st.form(f"quiz_form_attempt_{st.session_state.quiz_attempt_number}"):
             answers: List[int] = []
@@ -937,59 +938,61 @@ if pack:
                         result.next_difficulty,
                         focus_concepts=st.session_state.active_focus_concepts,
                     )
+    with right_col:
+        if st.session_state.quiz_submitted and st.session_state.result:
+            result: QuizResult = st.session_state.result
+            st.subheader("Performance Report")
 
-if st.session_state.quiz_submitted and st.session_state.result:
-    result: QuizResult = st.session_state.result
-    st.divider()
-    st.subheader("Performance Report")
+            st.metric("Score", f"{result.score}/{result.total}")
+            st.metric("Accuracy", f"{result.accuracy * 100:.0f}%")
+            st.metric("Average Confidence", f"{result.avg_confidence:.2f}/5")
+            st.write(
+                f"**Adaptive route (confidence-based):** next quiz difficulty is "
+                f"**{result.next_difficulty}**"
+            )
+            st.caption("Routing rule: confidence 1-2 -> foundational, 3 -> standard, 4-5 -> advanced")
 
-    st.metric("Score", f"{result.score}/{result.total}")
-    st.metric("Accuracy", f"{result.accuracy * 100:.0f}%")
-    st.metric("Average Confidence", f"{result.avg_confidence:.2f}/5")
-    st.write(
-        f"**Adaptive route (confidence-based):** next quiz difficulty is "
-        f"**{result.next_difficulty}**"
-    )
-    st.caption("Routing rule: confidence 1-2 -> foundational, 3 -> standard, 4-5 -> advanced")
+            if st.session_state.active_focus_concepts:
+                st.write(
+                    "**Concept weighting for future quizzes:** "
+                    + ", ".join(st.session_state.active_focus_concepts)
+                )
 
-    if st.session_state.active_focus_concepts:
-        st.write(
-            "**Concept weighting for future quizzes:** "
-            + ", ".join(st.session_state.active_focus_concepts)
-        )
+            if result.confidence_mismatch:
+                st.warning(
+                    "Confidence mismatch detected (confidence did not align with correctness). "
+                    "Added deeper explanations and recommend reviewing fundamentals of missed concepts."
+                )
 
-    if result.confidence_mismatch:
-        st.warning(
-            "Confidence mismatch detected (confidence did not align with correctness). "
-            "Added deeper explanations and recommend reviewing fundamentals of missed concepts."
-        )
+            ex_pack: Optional[ExplanationsPack] = st.session_state.explanations
+            if ex_pack and ex_pack.explanations:
+                st.subheader("Targeted Explanations")
+                for i, exp in enumerate(ex_pack.explanations, start=1):
+                    st.markdown(f"**Explanation {i}**")
+                    st.markdown(exp)
+                    if i < len(ex_pack.explanations):
+                        st.markdown("---")
 
-    ex_pack: Optional[ExplanationsPack] = st.session_state.explanations
-    if ex_pack and ex_pack.explanations:
-        st.subheader("Targeted Explanations")
-        for i, exp in enumerate(ex_pack.explanations, start=1):
-            st.markdown(f"**Explanation {i}**")
-            st.markdown(exp)
-            if i < len(ex_pack.explanations):
-                st.markdown("---")
+                st.subheader("Recommended Study Actions")
+                for i, rec in enumerate(ex_pack.recommendations, start=1):
+                    st.write(f"{i}. {rec}")
 
-        st.subheader("Recommended Study Actions")
-        for i, rec in enumerate(ex_pack.recommendations, start=1):
-            st.write(f"{i}. {rec}")
-
-    next_quiz: Optional[StudyPack] = st.session_state.next_quiz_pack
-    if next_quiz:
-        st.subheader(f"Next Quiz Preview (Attempt {st.session_state.quiz_attempt_number + 1})")
-        st.caption("Generated using confidence-based routing and historical weak-concept weighting.")
-        for i, q in enumerate(next_quiz.quiz, start=1):
-            st.write(f"Q{i}: {q.question}")
-            for opt in q.options:
-                st.write(f"- {opt}")
-        if st.button("Start Next Quiz"):
-            st.session_state.study_pack = next_quiz
-            st.session_state.quiz_submitted = False
-            st.session_state.result = None
-            st.session_state.explanations = None
-            st.session_state.next_quiz_pack = None
-            st.session_state.quiz_attempt_number += 1
-            st.rerun()
+            next_quiz: Optional[StudyPack] = st.session_state.next_quiz_pack
+            if next_quiz:
+                st.subheader(f"Next Quiz Preview (Attempt {st.session_state.quiz_attempt_number + 1})")
+                st.caption("Generated using confidence-based routing and historical weak-concept weighting.")
+                for i, q in enumerate(next_quiz.quiz, start=1):
+                    st.write(f"Q{i}: {q.question}")
+                    for opt in q.options:
+                        st.write(f"- {opt}")
+                if st.button("Start Next Quiz"):
+                    st.session_state.study_pack = next_quiz
+                    st.session_state.quiz_submitted = False
+                    st.session_state.result = None
+                    st.session_state.explanations = None
+                    st.session_state.next_quiz_pack = None
+                    st.session_state.quiz_attempt_number += 1
+                    st.rerun()
+        else:
+            st.subheader("Performance Report")
+            st.caption("Submit the current quiz to see evaluation and targeted explanations here.")
