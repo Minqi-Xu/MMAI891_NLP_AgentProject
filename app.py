@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import tempfile
 from dataclasses import dataclass
@@ -270,6 +271,33 @@ def sentence_chunks(text: str, n: int = 5) -> List[str]:
     return [sentences[i % len(sentences)] for i in range(n)]
 
 
+def weighted_sample_concepts(
+    concepts: List[str], focus_concepts: Optional[List[str]], k: int = 5
+) -> List[str]:
+    """Sample quiz concepts with replacement weighted toward historically weak concepts."""
+    if not concepts:
+        return []
+
+    unique = list(dict.fromkeys([c.strip().lower() for c in concepts if c.strip()]))
+    if not unique:
+        return []
+
+    focus_set = set(c.strip().lower() for c in (focus_concepts or []) if c.strip())
+    weights = [3.0 if c in focus_set else 1.0 for c in unique]
+
+    # weighted random picks; de-duplicate while preserving draw order.
+    drawn = random.choices(unique, weights=weights, k=min(k * 3, max(10, k)))
+    picked = list(dict.fromkeys(drawn))
+
+    # Ensure exactly k concepts when possible.
+    for c in unique:
+        if len(picked) >= min(k, len(unique)):
+            break
+        if c not in picked:
+            picked.append(c)
+    return picked[: min(k, len(unique))]
+
+
 def fallback_study_pack(
     text: str, difficulty: str = "standard", focus_concepts: Optional[List[str]] = None
 ) -> StudyPack:
@@ -282,13 +310,17 @@ def fallback_study_pack(
         lw = w.lower()
         if lw not in concepts:
             concepts.append(lw)
-        if len(concepts) >= 8:
+        if len(concepts) >= 40:
             break
     if not concepts:
         concepts = ["core concept", "key idea", "application", "analysis"]
     if focus_concepts:
         prioritized = [c.strip().lower() for c in focus_concepts if c.strip()]
         concepts = list(dict.fromkeys(prioritized + concepts))
+
+    quiz_concepts = weighted_sample_concepts(concepts, focus_concepts, k=5)
+    if len(quiz_concepts) < 5:
+        quiz_concepts = (quiz_concepts + concepts)[:5]
 
     questions: List[QuizQuestion] = []
     level_word = {
@@ -298,7 +330,7 @@ def fallback_study_pack(
     }.get(difficulty, "intermediate")
 
     for i in range(5):
-        concept = concepts[i % len(concepts)]
+        concept = quiz_concepts[i % len(quiz_concepts)]
         stem = chunks[(i + 2) % len(chunks)]
         question = f"({level_word}) What is the best interpretation of this material segment? {stem[:120]}"
         if difficulty == "foundational":
@@ -319,7 +351,7 @@ def fallback_study_pack(
             )
         )
 
-    return StudyPack(summary=summary, key_concepts=concepts[:5], quiz=questions)
+    return StudyPack(summary=summary, key_concepts=concepts, quiz=questions)
 
 
 def summarize_chunk_with_llm(client: OpenAI, chunk: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
@@ -352,15 +384,7 @@ def generate_study_pack_with_llm(
     focus_concepts: Optional[List[str]] = None,
     topic: Optional[str] = None,
 ) -> StudyPack:
-    """Create summary, key concepts, and quiz using direct or chunk-aggregated source."""
-    system_prompt = (
-        "You are an educational assistant. Return strict JSON with keys: "
-        "summary (string), key_concepts (array of strings), quiz (array of exactly 5 objects). "
-        "Each quiz object needs: question (string), options (array of 4 strings), "
-        "correct_index (0-3 int), explanation (string), concept (string). "
-        "Use only the provided source material. Do not use external knowledge. "
-        "If a fact is not in the source, do not include it."
-    )
+    """Create summary + concept inventory, then generate weighted-random concept quiz."""
 
     chunks = chunk_text(text)
     if len(chunks) == 1:
@@ -388,14 +412,6 @@ def generate_study_pack_with_llm(
             + ", ".join(concept_pool[:30])
         )
 
-    focus_instruction = ""
-    if focus_concepts:
-        focus_instruction = (
-            "Prior weak concepts to prioritize in the quiz:\n"
-            + ", ".join(focus_concepts)
-            + "\nEnsure at least 3 questions are centered on these concepts.\n"
-        )
-
     hint_instruction = (
         "For foundational difficulty, include a short hint in each question stem.\n"
         if difficulty == "foundational"
@@ -404,37 +420,91 @@ def generate_study_pack_with_llm(
 
     topic_instruction = f"Topic label: {topic}\n" if topic else ""
 
-    user_prompt = f"""
+    concept_prompt = f"""
 Source material:
 {source_for_generation}
 {topic_instruction}
-{focus_instruction}
 
 Task:
 1) Create a concise structured summary suitable for student revision.
-2) Extract 5 key concepts.
-3) Create 5 multiple-choice questions at {difficulty} difficulty.
-4) Questions must test understanding, not just copying text.
-5) Keep explanations short but instructive.
-6) For each question, ensure explanation includes why the correct option is right and why one likely wrong option is wrong.
-7) Every question and option must be fully answerable from the provided source material only.
-8) Do not use external facts, assumptions, or prior domain knowledge.
+2) Extract a comprehensive list of key concepts from the source material (not limited to 5).
+3) Use only the provided source material. Do not use external knowledge.
+Return only valid JSON.
+"""
+
+    concept_response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON with keys: summary (string), key_concepts (array of strings). "
+                    "Use only provided source material. Do not invent content."
+                ),
+            },
+            {"role": "user", "content": concept_prompt},
+        ],
+        temperature=0.2,
+    )
+    concept_data = safe_json_load(concept_response.output_text)
+    summary = clean_text(str(concept_data.get("summary", "")))
+    key_concepts_raw = concept_data.get("key_concepts", [])
+    key_concepts = list(
+        dict.fromkeys(
+            clean_text(str(c)).lower()
+            for c in key_concepts_raw
+            if clean_text(str(c))
+        )
+    )
+    if not key_concepts:
+        key_concepts = ["core concept", "key idea", "application", "analysis"]
+
+    selected_quiz_concepts = weighted_sample_concepts(key_concepts, focus_concepts, k=5)
+    if len(selected_quiz_concepts) < 5:
+        selected_quiz_concepts = (selected_quiz_concepts + key_concepts)[:5]
+
+    quiz_prompt = f"""
+Source material:
+{source_for_generation}
+{topic_instruction}
+
+Target quiz concepts (generate one question per concept, in this order):
+{json.dumps(selected_quiz_concepts)}
+
+Task:
+1) Create exactly 5 multiple-choice questions at {difficulty} difficulty.
+2) Each question must be grounded in its assigned target concept from the provided list.
+3) Questions must test understanding, not just copying text.
+4) Keep explanations short but instructive.
+5) For each question, explanation must include why correct option is correct and why a likely wrong option is wrong.
+6) Every question and option must be fully answerable from the provided source material only.
+7) Do not use external facts, assumptions, or prior domain knowledge.
 {hint_instruction}
 Return only valid JSON.
 """
 
-    response = client.responses.create(
+    quiz_response = client.responses.create(
         model=model,
         input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON with key quiz (array of exactly 5 objects). "
+                    "Each object: question (string), options (array of 4 strings), "
+                    "correct_index (0-3 int), explanation (string), concept (string). "
+                    "Use only provided source material."
+                ),
+            },
+            {"role": "user", "content": quiz_prompt},
         ],
         temperature=0.3,
     )
 
-    raw_text = response.output_text
-    parsed = safe_json_load(raw_text)
-    return StudyPack.model_validate(parsed)
+    quiz_data = safe_json_load(quiz_response.output_text)
+    quiz_items = quiz_data.get("quiz", [])
+    return StudyPack.model_validate(
+        {"summary": summary, "key_concepts": key_concepts, "quiz": quiz_items}
+    )
 
 
 def evaluate_quiz(
@@ -507,6 +577,12 @@ Provide strict JSON with:
   Each explanation must explicitly include:
   (a) why the correct option is correct
   (b) why the learner's selected option is incorrect
+  Format each explanation with readable markdown sections:
+  **Concept:** ...
+  **Your Answer:** ...
+  **Correct Answer:** ...
+  **Why Correct:** ...
+  **Why Your Answer Is Incorrect:** ...
 - recommendations: array of 3 targeted study actions
 """
 
@@ -529,9 +605,12 @@ def fallback_explanations(
         chosen = q.options[answers[idx]]
         correct = q.options[q.correct_index]
         exps.append(
-            f"For concept '{q.concept}', the correct answer is '{correct}' because it matches the key idea. "
-            f"Your selected answer '{chosen}' is incorrect because it does not align with the concept focus. "
-            f"Detailed reason: {q.explanation}"
+            f"**Concept:** {q.concept}\n\n"
+            f"**Your Answer:** {chosen}\n\n"
+            f"**Correct Answer:** {correct}\n\n"
+            f"**Why Correct:** It matches the key idea from the uploaded material.\n\n"
+            f"**Why Your Answer Is Incorrect:** It does not align with the concept focus in the material.\n\n"
+            f"**Extra Detail:** {q.explanation}"
         )
 
     recs = [
@@ -604,11 +683,10 @@ with st.sidebar:
         f"Use `OPENAI_API_KEY` env var or store key in `{API_KEY_FILE}` to use LLM mode."
     )
     st.caption(f"Memory file: `{MEMORY_FILE}`")
-    st.page_link("pages/Quiz_History.py", label="View Quiz History by Topic")
     with st.popover("Clear Current Page Output"):
         st.write(
-            "This clears generated summaries, quizzes, and reports from the current page. "
-            "The topic text will be kept."
+            "This clears generated summaries, quizzes, reports, and uploaded files from "
+            "the current page. The topic text will be kept."
         )
         if st.button("Confirm Clear Current Output", type="secondary"):
             clear_current_outputs(preserve_topic=True)
@@ -616,7 +694,7 @@ with st.sidebar:
     with st.popover("Clear All Saved Memory"):
         st.write(
             "This permanently removes all saved topic memory from local storage "
-            f"(`{MEMORY_FILE}`). Current page output will also be cleared."
+            f"(`{MEMORY_FILE}`). Current page output and uploaded files will also be cleared."
         )
         if st.button("Confirm Clear All Saved Memory", type="secondary"):
             clear_memory()
@@ -890,7 +968,10 @@ if st.session_state.quiz_submitted and st.session_state.result:
     if ex_pack and ex_pack.explanations:
         st.subheader("Targeted Explanations")
         for i, exp in enumerate(ex_pack.explanations, start=1):
-            st.write(f"{i}. {exp}")
+            st.markdown(f"**Explanation {i}**")
+            st.markdown(exp)
+            if i < len(ex_pack.explanations):
+                st.markdown("---")
 
         st.subheader("Recommended Study Actions")
         for i, rec in enumerate(ex_pack.recommendations, start=1):

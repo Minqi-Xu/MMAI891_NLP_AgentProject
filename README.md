@@ -6,7 +6,9 @@ This project implements a **Create-mode agentic POC** based on your Agent Design
 - Output: summary, quiz, performance report, and adaptive follow-up quiz preview
 - Long-input handling: automatic chunking and chunk-summary aggregation for large multi-file content sets
 - Persistent local memory per topic: previous confidence and weak concepts are saved to `data/user_memory.json`
-- Separate history page: `Quiz History by Topic` (open from sidebar link in main page)
+- Separate history page: `Quiz History by Topic` (open from top page navigation)
+- Key concepts are extracted comprehensively from source material (not capped at 5)
+- Quiz remains fixed at 5 questions, sampled from extracted concepts with higher weight on previously weak concepts
 
 ## 1) Quick Start
 

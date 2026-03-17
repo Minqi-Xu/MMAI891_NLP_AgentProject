@@ -2,6 +2,7 @@ import json
 import os
 from typing import Any, Dict, List
 
+import altair as alt
 import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -143,18 +144,50 @@ else:
                     {
                         "attempt": i + 1,
                         "accuracy_pct": float(h.get("accuracy_pct", 0)),
-                        "score": float(h.get("score", 0)),
-                        "avg_confidence": float(h.get("avg_confidence", 0)),
+                        "confidence_scaled": float(h.get("avg_confidence", 0)) * 20.0,
                     }
                     for i, h in enumerate(history)
                 ]
                 st.subheader("Progress Trend")
-                st.line_chart(
-                    {
-                        "accuracy_pct": [r["accuracy_pct"] for r in trend_rows],
-                        "score": [r["score"] for r in trend_rows],
-                        "avg_confidence": [r["avg_confidence"] for r in trend_rows],
-                    }
+                trend_data = trend_rows
+                accuracy_line = (
+                    alt.Chart(alt.Data(values=trend_data))
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("attempt:Q", title="Attempt"),
+                        y=alt.Y(
+                            "accuracy_pct:Q",
+                            title="Accuracy (%)",
+                            scale=alt.Scale(domain=[0, 100]),
+                        ),
+                        color=alt.value("#1f77b4"),
+                    )
+                )
+                confidence_line = (
+                    alt.Chart(alt.Data(values=trend_data))
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("attempt:Q", title="Attempt"),
+                        y=alt.Y(
+                            "confidence_scaled:Q",
+                            title="Confidence (1-5)",
+                            scale=alt.Scale(domain=[0, 100]),
+                            axis=alt.Axis(
+                                orient="right",
+                                values=[20, 40, 60, 80, 100],
+                                labelExpr="datum.value / 20",
+                            ),
+                        ),
+                        color=alt.value("#ff7f0e"),
+                    )
+                )
+                st.altair_chart(
+                    alt.layer(accuracy_line, confidence_line).resolve_scale(y="independent"),
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Legend: Blue line = Accuracy (%). "
+                    "Orange line = Confidence x20 (right axis displayed as 1-5)."
                 )
 
                 # Newest first for readability in the table.
