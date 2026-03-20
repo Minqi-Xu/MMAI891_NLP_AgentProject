@@ -74,7 +74,7 @@ def compute_improvement(history: List[Dict[str, Any]]) -> Dict[str, float]:
 # attempt history, improvement deltas, and concept-level weak spots.
 st.set_page_config(page_title="Quiz History", layout="wide")
 st.title("Quiz History by Topic")
-st.page_link("app.py", label="Back to Main App")
+st.page_link("Main_Page.py", label="Back to Main Page")
 
 memory = load_memory()
 topics = memory.get("topics", {})

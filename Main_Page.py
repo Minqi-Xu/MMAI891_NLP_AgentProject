@@ -326,6 +326,8 @@ def fallback_study_pack(
     if focus_concepts:
         prioritized = [c.strip().lower() for c in focus_concepts if c.strip()]
         concepts = list(dict.fromkeys(prioritized + concepts))
+    # Validation step for fallback path: keep concept list grounded and coherent.
+    concepts = fallback_validate_concepts(text, concepts)
 
     quiz_concepts = weighted_sample_concepts(concepts, focus_concepts, k=5)
     if len(quiz_concepts) < 5:
@@ -383,6 +385,276 @@ Chunk:
         temperature=0.2,
     )
     return safe_json_load(response.output_text)
+
+
+def fallback_validate_concepts(source_text: str, key_concepts: List[str]) -> List[str]:
+    """Heuristic concept validation when LLM validation is unavailable.
+
+    Keeps non-empty concepts and prioritizes concepts that appear in source text.
+    """
+    source_l = source_text.lower()
+    unique = list(dict.fromkeys(c.strip().lower() for c in key_concepts if c.strip()))
+    if not unique:
+        return []
+
+    in_source = [c for c in unique if c in source_l]
+    out_source = [c for c in unique if c not in source_l]
+    validated = in_source + out_source
+    return validated[:80]
+
+
+def validate_concepts_with_llm(
+    client: OpenAI,
+    source_text: str,
+    summary: str,
+    key_concepts: List[str],
+    model: str = "gpt-4o-mini",
+) -> List[str]:
+    """Validate extracted concepts for relevance, grounding, and redundancy.
+
+    This step mitigates misinterpretation risk by asking the model to remove
+    concepts that are not clearly supported by the source material.
+    """
+    prompt = f"""
+Source material:
+{source_text}
+
+Summary:
+{summary}
+
+Extracted concepts:
+{json.dumps(key_concepts)}
+
+Task:
+1) Remove concepts that are not clearly grounded in the source material.
+2) Remove concepts that are redundant, vague, or too generic.
+3) Keep concepts that accurately represent the material.
+4) Keep the output as a concept list (not explanations).
+
+Return strict JSON:
+{{
+  "validated_concepts": ["..."]
+}}
+"""
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Validate concept quality and grounding. "
+                    "Do not introduce new external concepts."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+    )
+    parsed = safe_json_load(response.output_text)
+    validated = parsed.get("validated_concepts", [])
+    return fallback_validate_concepts(source_text, [str(c) for c in validated])
+
+
+def fallback_validate_quiz_grounding(
+    source_text: str, quiz_items: List[Dict[str, Any]], key_concepts: List[str], difficulty: str
+) -> List[Dict[str, Any]]:
+    """Heuristic quiz grounding validator when LLM validation is unavailable.
+
+    If a question's concept is missing from source text, regenerate that item
+    using deterministic fallback generation to keep all 5 questions answerable.
+    """
+    source_l = source_text.lower()
+    validated: List[Dict[str, Any]] = []
+    replacement_pack = fallback_study_pack(source_text, difficulty=difficulty, focus_concepts=key_concepts)
+    replacement_idx = 0
+
+    for item in quiz_items:
+        concept = str(item.get("concept", "")).strip().lower()
+        if concept and concept in source_l:
+            validated.append(item)
+        else:
+            q = replacement_pack.quiz[replacement_idx % len(replacement_pack.quiz)]
+            replacement_idx += 1
+            validated.append(
+                {
+                    "question": q.question,
+                    "options": q.options,
+                    "correct_index": q.correct_index,
+                    "explanation": q.explanation,
+                    "concept": q.concept,
+                }
+            )
+    return validated[:5]
+
+
+def check_question_grounding_with_llm(
+    client: OpenAI,
+    source_text: str,
+    question_item: Dict[str, Any],
+    model: str = "gpt-4o-mini",
+) -> bool:
+    """Return True if a question is directly answerable from provided source text."""
+    prompt = f"""
+Source material:
+{source_text}
+
+Question item:
+{json.dumps(question_item)}
+
+Task:
+Decide if this multiple-choice question can be answered directly and unambiguously
+from the source material, without external knowledge.
+
+Return strict JSON:
+{{
+  "answerable_from_source": true
+}}
+"""
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": "You are a strict grounding checker. Return only JSON.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+    )
+    parsed = safe_json_load(response.output_text)
+    return bool(parsed.get("answerable_from_source", False))
+
+
+def regenerate_single_question_with_llm(
+    client: OpenAI,
+    source_text: str,
+    concept: str,
+    difficulty: str,
+    model: str = "gpt-4o-mini",
+) -> Dict[str, Any]:
+    """Generate one grounded replacement question using the same quality bar as initial generation."""
+    hint_instruction = (
+        "Include a short hint in the question stem.\n" if difficulty == "foundational" else ""
+    )
+    prompt = f"""
+Source material:
+{source_text}
+
+Target concept:
+{concept}
+
+Task:
+Create exactly one multiple-choice question (4 options) that is fully answerable
+from the source material and focused on the target concept.
+Questions must test understanding (not copy text verbatim).
+Keep explanation concise and instructive.
+Explanation must include:
+- why the correct option is correct
+- why one likely wrong option is incorrect
+Do not use external facts, assumptions, or prior domain knowledge.
+{hint_instruction}
+
+Return strict JSON:
+{{
+  "question": "...",
+  "options": ["...","...","...","..."],
+  "correct_index": 0,
+  "explanation": "...",
+  "concept": "{concept}"
+}}
+"""
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": "Generate one source-grounded quiz item in strict JSON.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return safe_json_load(response.output_text)
+
+
+def strict_validate_and_repair_quiz_with_llm(
+    client: OpenAI,
+    source_text: str,
+    quiz_items: List[Dict[str, Any]],
+    selected_quiz_concepts: List[str],
+    difficulty: str,
+    model: str = "gpt-4o-mini",
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Strict question-level validation.
+
+    Flow per question:
+    1) Validate if answerable from source.
+    2) If valid, keep original item unchanged.
+    3) If invalid, regenerate from source and validate again.
+    4) If still invalid, regenerate once more.
+    5) If still invalid, fallback deterministic replacement and count as unresolved.
+    6) Surface unresolved count to UI so users know conservative fallback was used.
+    """
+    fallback_pack = fallback_study_pack(
+        source_text, difficulty=difficulty, focus_concepts=selected_quiz_concepts
+    )
+    validated: List[Dict[str, Any]] = []
+    unresolved_count = 0
+
+    base_items = (quiz_items or [])[:5]
+    # Ensure exactly 5 candidates are present for validation loop.
+    while len(base_items) < 5:
+        q = fallback_pack.quiz[len(base_items) % len(fallback_pack.quiz)]
+        base_items.append(
+            {
+                "question": q.question,
+                "options": q.options,
+                "correct_index": q.correct_index,
+                "explanation": q.explanation,
+                "concept": q.concept,
+            }
+        )
+
+    for i, item in enumerate(base_items):
+        concept = str(item.get("concept", "")).strip() or selected_quiz_concepts[i % len(selected_quiz_concepts)]
+        current = item
+        try:
+            if check_question_grounding_with_llm(client, source_text, current, model=model):
+                validated.append(current)
+                continue
+        except Exception:
+            pass
+
+        # Regenerate and validate again (attempt 1)
+        for _ in range(2):
+            try:
+                regenerated = regenerate_single_question_with_llm(
+                    client=client,
+                    source_text=source_text,
+                    concept=concept,
+                    difficulty=difficulty,
+                    model=model,
+                )
+                if check_question_grounding_with_llm(client, source_text, regenerated, model=model):
+                    validated.append(regenerated)
+                    break
+            except Exception:
+                continue
+        else:
+            # Final deterministic fallback after failed validation attempts.
+            unresolved_count += 1
+            q = fallback_pack.quiz[i % len(fallback_pack.quiz)]
+            validated.append(
+                {
+                    "question": q.question,
+                    "options": q.options,
+                    "correct_index": q.correct_index,
+                    "explanation": q.explanation,
+                    "concept": q.concept,
+                }
+            )
+
+    return validated[:5], unresolved_count
 
 
 def generate_study_pack_with_llm(
@@ -465,6 +737,14 @@ Return only valid JSON.
             if clean_text(str(c))
         )
     )
+    # Validation step: remove weak/ungrounded concepts before quiz sampling.
+    key_concepts = validate_concepts_with_llm(
+        client=client,
+        source_text=source_for_generation,
+        summary=summary,
+        key_concepts=key_concepts,
+        model=model,
+    )
     if not key_concepts:
         key_concepts = ["core concept", "key idea", "application", "analysis"]
 
@@ -511,8 +791,38 @@ Return only valid JSON.
 
     quiz_data = safe_json_load(quiz_response.output_text)
     quiz_items = quiz_data.get("quiz", [])
+    # Strict validation step: keep valid questions unchanged; regenerate invalid
+    # questions from source and validate again before acceptance.
+    try:
+        validated_quiz_items, unresolved_count = strict_validate_and_repair_quiz_with_llm(
+            client=client,
+            source_text=source_for_generation,
+            quiz_items=quiz_items,
+            selected_quiz_concepts=selected_quiz_concepts,
+            difficulty=difficulty,
+            model=model,
+        )
+        if unresolved_count > 0:
+            st.session_state["last_generation_notice"] = (
+                f"{unresolved_count} question(s) could not be validated as fully grounded after "
+                "multiple regeneration attempts. A conservative fallback format was used for those "
+                "items to keep the quiz reliable and answerable from your materials."
+            )
+        else:
+            st.session_state["last_generation_notice"] = ""
+    except Exception:
+        validated_quiz_items = fallback_validate_quiz_grounding(
+            source_text=source_for_generation,
+            quiz_items=quiz_items,
+            key_concepts=key_concepts,
+            difficulty=difficulty,
+        )
+        st.session_state["last_generation_notice"] = (
+            "Automatic grounding validation encountered a technical issue. A conservative fallback "
+            "question format was used to keep the quiz answerable from your uploaded material."
+        )
     return StudyPack.model_validate(
-        {"summary": summary, "key_concepts": key_concepts, "quiz": quiz_items}
+        {"summary": summary, "key_concepts": key_concepts, "quiz": validated_quiz_items}
     )
 
 
@@ -647,6 +957,7 @@ def init_state() -> None:
         "active_difficulty": "standard",
         "quiz_attempt_number": 1,
         "uploader_key_version": 0,
+        "last_generation_notice": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -668,6 +979,7 @@ def clear_current_outputs(preserve_topic: bool = True) -> None:
     st.session_state.active_difficulty = "standard"
     st.session_state.quiz_attempt_number = 1
     st.session_state.uploader_key_version += 1
+    st.session_state.last_generation_notice = ""
     st.session_state.topic = topic_value
 
 
@@ -817,12 +1129,15 @@ if st.button("Generate Summary + Initial Quiz", type="primary"):
                         difficulty,
                         focus_concepts=historical_focus,
                     )
+                    st.session_state.last_generation_notice = ""
                 st.session_state.study_pack = pack
                 st.session_state.quiz_submitted = False
                 st.session_state.result = None
                 st.session_state.explanations = None
                 st.session_state.next_quiz_pack = None
                 st.session_state.quiz_attempt_number = 1
+                if st.session_state.last_generation_notice:
+                    st.warning(st.session_state.last_generation_notice)
             except (ValidationError, json.JSONDecodeError, Exception):
                 # Reliability fallback: keep the UX functional even if model JSON is malformed.
                 pack = fallback_study_pack(
@@ -830,6 +1145,7 @@ if st.button("Generate Summary + Initial Quiz", type="primary"):
                     difficulty,
                     focus_concepts=historical_focus,
                 )
+                st.session_state.last_generation_notice = ""
                 st.session_state.study_pack = pack
                 st.session_state.quiz_submitted = False
                 st.session_state.result = None
@@ -921,8 +1237,8 @@ if pack:
                         )
                 st.session_state.explanations = ex_pack
 
-            # Generate adaptive second-round quiz as optional next step.
-            with st.spinner("Preparing adaptive next round..."):
+            # Generate the next adaptive quiz attempt after current submission.
+            with st.spinner("Preparing next adaptive quiz..."):
                 try:
                     # Prioritize concepts that are weak in this attempt and in
                     # historical topic performance.
@@ -985,7 +1301,16 @@ if pack:
             if ex_pack and ex_pack.explanations:
                 st.subheader("Targeted Explanations")
                 for i, exp in enumerate(ex_pack.explanations, start=1):
-                    st.markdown(f"**Explanation {i}**")
+                    # Explanation list aligns with result.wrong_indices order.
+                    wrong_q_idx = result.wrong_indices[i - 1] if i - 1 < len(result.wrong_indices) else None
+                    q_label = f"Q{(wrong_q_idx + 1)}" if wrong_q_idx is not None else f"Q?"
+                    q_text = (
+                        pack.quiz[wrong_q_idx].question
+                        if wrong_q_idx is not None and wrong_q_idx < len(pack.quiz)
+                        else "Question text unavailable."
+                    )
+                    st.markdown(f"**Explanation for {q_label}**")
+                    st.markdown(f"**Question:** {q_text}")
                     st.markdown(exp)
                     if i < len(ex_pack.explanations):
                         st.markdown("---")

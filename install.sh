@@ -35,4 +35,4 @@ fi
 "$VENV_PY" -c "import streamlit, openai, pydantic, docx, pptx, pypdf, dotenv; print('All required packages imported successfully.')"
 
 echo "Starting Streamlit app on http://localhost:8501 ..."
-exec "$VENV_STREAMLIT" run app.py
+exec "$VENV_STREAMLIT" run Main_Page.py

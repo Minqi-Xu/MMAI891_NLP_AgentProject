@@ -15,9 +15,15 @@ The app supports `.txt`, `.pdf`, `.docx`, and `.pptx` uploads.
 - Multi-file ingestion with long-document chunking
 - Grounded generation (quiz content constrained to uploaded material)
 - Comprehensive concept extraction (not limited to 5 concepts)
+- Post-summary concept validation to filter weak or ungrounded concepts
 - Fixed 5-question quizzes using weighted concept sampling
   - random concept selection across extracted concepts
   - higher weight for historically weak concepts
+- Post-quiz grounding validation with strict verify/repair loop:
+  - verify each question is answerable from uploaded materials
+  - keep valid questions unchanged
+  - regenerate invalid questions using the same quality rules as initial generation and validate again
+  - notify the user when conservative fallback questions are used after repeated failed validation
 - Confidence-based difficulty routing
   - confidence 1-2: foundational
   - confidence 3: standard
@@ -30,11 +36,24 @@ The app supports `.txt`, `.pdf`, `.docx`, and `.pptx` uploads.
 
 ## Project Structure
 
-- `app.py`: main application UI and generation/evaluation pipeline
-- `pages/Quiz_History.py`: historical analytics and trend visualization
-- `evaluation/user_progress_report.py`: CLI report from saved history
-- `data/`: local runtime data and optional synthetic files
-- `secrets/openai_api_key.txt`: optional local API key file (ignored by git)
+```text
+.
+├── Main_Page.py
+├── README.md
+├── requirements.txt
+├── install.sh
+├── install_transcript.txt
+├── pages/
+│   └── Quiz_History.py
+├── evaluation/
+│   └── user_progress_report.py
+├── data/
+│   ├── synthetic_biology_notes.txt
+│   └── user_memory.json
+└── secrets/
+    ├── openai_api_key.txt.example
+    └── openai_api_key.txt
+```
 
 ## Quick Start
 
@@ -60,7 +79,7 @@ Windows note:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run Main_Page.py
 ```
 
 ## OpenAI API Configuration
@@ -89,6 +108,7 @@ If no key is available, the app runs in fallback mode.
 5. Submit quiz to see:
    - performance report
    - targeted explanations
+   - explanation blocks mapped to specific missed questions (Q# + question text)
    - recommended study actions
    - next adaptive quiz preview
 6. Open `Quiz History` page to review progress by topic.

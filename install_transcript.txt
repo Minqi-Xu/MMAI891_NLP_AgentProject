@@ -8,10 +8,10 @@ python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -c "import streamlit, openai, pydantic, docx, pptx, pypdf, dotenv; print('All required packages imported successfully.')"
-.venv/bin/streamlit run app.py
+.venv/bin/streamlit run Main_Page.py
 
 # Windows paths (Git Bash / PowerShell)
 .venv/Scripts/python.exe -m pip install --upgrade pip
 .venv/Scripts/pip.exe install -r requirements.txt
 .venv/Scripts/python.exe -c "import streamlit, openai, pydantic, docx, pptx, pypdf, dotenv; print('All required packages imported successfully.')"
-.venv/Scripts/streamlit.exe run app.py
+.venv/Scripts/streamlit.exe run Main_Page.py
